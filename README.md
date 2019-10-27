@@ -87,6 +87,8 @@ An adjustment allows to do one or more of the following (see the documentation f
 
 A confirmation must set the eagerness of the confirming endpoint. The endpoint that didn't send the proposal starts out expecting mandatory payloads, having a minimum payload size of zero and a maximum payload size of 2^64 - 1.
 
+It is possible for both endpoitns to concurrently propose overlapping ranges. Whenever an endpoint receives a proposal whose range overlaps with the range of a not-yet-confirmed proposal it has sent, it acts as if the proposal that begins at a larger sequence number had never been sent. In case of equal starting points, it drops the one sent by the reactive endpoint.
+
 In addition to adjusting proposals, it is also possible to cancel them, even before they have been confirmed. When an endpoint cancels a proposal, the other endpoint also cancels it in confirmation. Both endpoints also send a special indicator over the data channel that confirms the cancellation, so there are four messages in total involved in cancellation of a proposal. Once all four of these have been sent/received, all state associated with the proposal can be released and its id can be reused if so desired. The confirmation of cancellation and the messages on the data channel are necessary to ensure correctness in all scenarios, even under concurrent sending by both endpoints over both channels. It doesn't matter whether one endpoint cancelled in confirmation of the other endpoint's confirmation, or whether both endpoints cancel concurrently for their own reasons.
 
 Cancellation can happen for multiple reasons, and endpoints might want to react differently to different ones. The following possibilities can be expressed:
