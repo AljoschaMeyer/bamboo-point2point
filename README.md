@@ -21,11 +21,11 @@ The protocol assumes two reliable, ordered, bidirectional, byte-oriented communi
 
 Replication of logs is fundamentally bidirectional: when both endpoints are interested in entries from a specific log, either of them can relay new data to the other. The replication protocol works by letting any endpoints *propose* to synchronize (parts of) a log. Once the other endpoint has *accepted* such a proposal, the endpoints can then use the data channel to bring each other up to speed with both stored data and as live data becomes available.
 
-To keep things simple, synchronization proposals are restricted to ranges within a log, rather than allowing random-access to arbitrary subsets. Random access can be emulated by sending multiple proposals for different (small) ranges. Transmission of data also follows a strict order: the peers essentially send updates in the order in which they occur in the logs. It is possible to skip over some data, but then the peers cannot go back to transmit it at a later time. Retroactive delivery can however be emulated sending dedicated synchronization proposals for the data that had been skipped over previously.
+To keep things simple, synchronization proposals are restricted to ranges within a log, rather than allowing random-access to arbitrary subsets. Random access can be emulated by sending multiple proposals for different (small) ranges. Transmission of data follows a strict order: the peers essentially send updates in the order in which they occur in the logs. It is possible to skip over some data, but then the peers cannot go back to transmit it at a later time. Retroactive delivery can however be emulated by sending dedicated synchronization proposals for the data that had been skipped over previously.
 
 ## Session Setup
 
-Before the regular synchronization part of the protocol begins, the two endpoits need to agree on a bit of metadata. The protocol requires a way of breaking symmetry between the endpoints. One of the endpoints is called the *proactive* endpoint, the other one is the *reactive* endpoint. How exactly these roles are assigned is irrelevant, as long as both endpoints agree on which role they hold (and they don't both hold the same role). A simple way of assigning these roles is to let the endpoint that initiated the connection be the *proactive* one and the one that accepted the connection attempt be the *reactive* one.
+Before the regular synchronization phase of the protocol begins, the two endpoits need to agree on a bit of metadata. The protocol requires a way of breaking symmetry between the endpoints. One of the endpoints is called the *proactive* endpoint, the other one is the *reactive* endpoint. How exactly these roles are assigned is irrelevant, as long as both endpoints agree on which role they hold (and they don't both hold the same role). A simple way of assigning these roles is to let the endpoint that initiated the connection be the *proactive* one and the one that accepted the connection attempt be the *reactive* one.
 
 Next, each endpoint must convey four pieces of information to the other one (their precise meaning will be explained later):
 
@@ -41,19 +41,19 @@ The precise way of how this data is exchanged is irrelevant for the further proc
 - the *compression window*: the minimum of the maximum compression window size this endpoint wanted to send and the maximum compression window size that the other endpoint wanted to receive
 - the *decompression window*: the minimum of the maximum compression window size this endpoint wanted to receive and the maximum compression window size that the other endpoint wanted to send
 
-The send mode of one endpoint matches the receive mode of the other endpoint, and vice versa. The same holds for compression window and decompression window.
+The send mode of one endpoint matches the receive mode of the other endpoint, and vice versa. The same holds for the compression window and the decompression window.
 
 ## The Control Channel
 
-Synchronization proposals are managed via the control channel. Since proposals incur unbounded state on the other endpoints (even if they are rejected immediately, that rejected has to be transmitted, which might involve buffering), endpoints are not allowed to send an unbounded number of proposals. Instead, a credit-based system is used. At any point, an endpoint can use the control channel to give the other endpoint *proposal credit* units, up to a maximum of 2^64-1 units. Each unit of credit can be spent to issue one synchronization proposal on the control channel.
+Synchronization proposals are managed via the control channel. Since proposals incur state on the other endpoints (even if they are rejected immediately, that rejected has to be transmitted, which might involve buffering), endpoints are not allowed to send an unbounded number of proposals. Instead, a credit-based system is used. At any point, an endpoint can use the control channel to give the other endpoint *proposal credit* units, up to a maximum of 2^64-1 units. Each unit of credit can be spent to issue one synchronization proposal on the control channel.
 
 A synchronization proposal contains the following pieces of information:
 
 - shared information for both endpoints:
-  - an *synchronization id* (just *id* for short), a number between 0 and 2^64 - 1
-  - which *log* to synchronize: its author and its log id
+  - a *synchronization id* (just *id* for short), a number between 0 and 2^64 - 1 to identify the proposal in later messages
+  - which *log* to synchronize: its author's public key, and its log id
   - the *start* sequence number of the range of entries to synchronize
-  - the *lower certpool info*: a sequence number from the lower certificate pool of the *start* of the range. Synchronization begins by transmitting the metadata of the entries of in the lower certificate pool from this number up to the *start* number. See the explanation of the data channel for a more detailed explanation. This is omitted if a starting *offset* is supplied
+  - the *lower certpool info*: a sequence number from the lower certificate pool of the *start* of the range. Synchronization begins by transmitting the metadata of the entries of in the lower certificate pool from this number up to the *start* number. See the explanation of the data channel for a more detailed explanation. This is omitted if a starting *offset* is supplied.
   - the *expected starting hash* if one exists (see paragraph below for an explanation)
   - optionally: an *offset* into the payload of the start entry (may be zero). If this is present, then synchronization begins directly at that point in the payload, rather than with the metadata of the start entry.
   - optionally: an *end* sequence number for the range of entries to synchronize (inclusive), and an *upper certpool info* sequence number that indicates the smallest number in the upper certificate pool up to which to synchronize metadata after the *end* of the range has been reached (see the explanation of the data channel for a more detailed explanation).
@@ -61,7 +61,7 @@ A synchronization proposal contains the following pieces of information:
   - a flag to indicate whether replication of the range should be *sparse*. In sparse replication, rather than transmitting all entries between start and end of the range, only the shortest path from end to start (in the graph of lipmaalinks and backlinks) is transmitted.
 - information particular to the proposing endpoint:
   - the minimum payload size this endpoint is interested in, payloads below this size will be skipped over rather than transmitted by the other endpoint
-  - the maximum payload size this endpoint is interested in, payloads below this size will skipped over rather than transmitted by the other endpoint
+  - the maximum payload size this endpoint is interested in, payloads above this size will skipped over rather than transmitted by the other endpoint
   - a flag whether *mandatory payload* is activated, or whether it is ok for the other endpoint to skip over payloads even though their size is between the minimum and maximum payload sizes
   - how *eager* the endpoint is, asking the other endpoint to do one of the following:
     - send all data regarding this range
@@ -74,7 +74,7 @@ Since both endpoints can issue proposals concurrently, the proactive endpoint us
 
 After a range has been propopsed for synchronization, both endpoints can *adjust* or *cancel* the proposal. The first adjustment by the non-proposing endpoint serves as a *confirmation* for the proposal, after the confirmation has been sent/received, data can then be transmitted to perform the synchronization.
 
-An adjustment allows to do one or more of the following (see the documentation for proposals for more detaild explanations of the points):
+An adjustment allows to do one or more of the following (see the documentation for proposals above for more detailed explanations of the bullt points):
 
 - shared information for both endpoints:
   - decrease the end sequence number of the range
@@ -115,23 +115,25 @@ Each proposal specifies which data needs to be transmitted, beginning with the m
 
 Synchronization works by having the endpoints advance their cursor by sending data, until the end of the range is reached (if an end exists). Moving the cursor can be done in different ways:
 
-- notifying of some number of pieces of data: advances the cursor without actually transmitting the data. This is used when the other endpoints requested notifications rather than actual data transfer in its eagerness. It is also used to move the cursor of one data past data that has already been transmitted by the other endpoint (this must be done explicitly to ensure correctness in case of concurrent data transmission by both endpoints).
+- notifying of some number of pieces of data: advances the cursor without actually transmitting the data. This is used when the other endpoints requested notifications rather than actual data transfer in its eagerness. It is also used to move the cursor of one enndpoint past data that has already been transmitted by the other endpoint (this must be done explicitly to ensure correctness in case of concurrent transmissions by both endpoints).
 - advance the cursor past one payload because it is smaller than the minimum size to be transmitted
 - advance the cursor past one payload because it is larger than the maximum size to be transmitted
 - advance the cursor past one payload because it is unavailable (only allowed if transmission of payloads is not mandatory)
-- advance within a payload by some number of bytes, without actually sending them (this only allowed to allow the cursor of one endpoint to catch up with the cursor of the other endpoint - in such a situation the peers would switch the role of which one is "ahead" within a single payload... such situations seem rather contrived, but the protocol supports them)
+- advance within a payload by some number of bytes, without actually sending them (this is only allowed to let the cursor of one endpoint to catch up with the cursor of the other endpoint - in such a situation the peers would switch the role of which one is "ahead" within a single payload... such situations seem rather contrived, but the protocol supports them)
 - sending the metadata of an entry (the actual encoding omits some of it that can be reconstructed from context)
 - sending some number of bytes of a payload
 
 Payloads can be sent in raw form or in compressed form. The compression format is [LZFoo](https://github.com/AljoschaMeyer/lzfoo). When sending data, the maximum size of the compression window that has been negotiated at the beginning of the connection must be respected. Copy instructions may not point further into the path than the window size. The same backlog of decompressed data is shared across all different synchronization proposals, and the window is never reset. This allows to achieve good compression even for short payloads and when payloads from multiple proposals are interleaved. When raw data is transferred, it does *not* contribute to the decompression buffer.
 
-The other options negated during connection setup are whether sending of data is greedy or safe. In safe send mode, an endpoint is only allowd to transmit metadata and payloads that passed verification - invalid data leads to the whole connection being terminated immediately. In greedy mode, data can be forwared immediately, before being verified. This is most beneficial in case of large payloads, where blocking for the full payload to arrive (to be able to verify it) would leed to long idle periods. Even in greedy mode, data must be verified once it has been fully transmitted. If an endpoint detects that it sent invalid data, it must immediately send an *apology*, both endpoints then move the cursor back by one and pretend the invalid data (either metadata or a payload) had never been transmitted. An apology can be sent in the middle of transferring a payload. An apology can not apply retroactively: if an endpoint sends invalid data and then begins sending the next piece of data for the same proposal, then the connection is terminated.
+The other options negated during connection setup are whether sending of data is greedy or safe. In safe send mode, an endpoint is only allowd to transmit metadata and payloads that passed verification - invalid data leads to the whole connection being terminated immediately. In greedy mode, data can be forwared immediately, before being verified. This is most beneficial in case of large payloads, where blocking for the full payload to arrive (to be able to verify it) would lead to long idle periods. Even in greedy mode, data must be verified once it has been fully transmitted. If an endpoint detects that it sent invalid data, it must immediately send an *apology*, both endpoints then move the cursor back by one and pretend the invalid data (either metadata or a payload) had never been transmitted. An apology can be sent in the middle of transferring a payload. An apology can not apply retroactively: if an endpoint sends invalid data and then begins sending the next piece of data for the same proposal, then the connection is terminated.
 
 ## Encodings
 
+TODO streamline terminology, this uses "request" instead of "proposal" etc.
+
 Encoding on the control channel:
 
-- the byte 0 indicates granting proposal credit, followed by the amount of credit units as a VarU64
+- the byte 0 indicates granting proposal credit, followed by the amount of credit units as a [VarU64](https://github.com/AljoschaMeyer/varu64)
 - a byte >= 1 and <= 127 (first bit is zero but at least one other bit is one): adjust
   - initial byte is followed by the request number as a VarU64
   - remaining seven bits of the first byte are flags, indicating which things to adjust. Some of them add more information by appending some additional bytes, in the order of the flags:
@@ -195,6 +197,7 @@ Invariants, drop connection if violated:
 - a range end (proposed or adjusted) is never strictly less than the start of the range
 - an upper certpool info (proposed or adjusted) is never strictly less than the end of the range
 - a lower certpool info (proposed or adjusted) is never strictly greater than the start of the range
+- lower and upper certpool infos are taken from the certificate pools of the start/end of the range respectively, this invariant must be preserved even as the end of a range is adjusted
 - a new minimum payload size is never strictly less than the old one
 - a new maximum payload size is never strictly legreater than the old one
 - sequence numbers are nonzero
@@ -256,4 +259,4 @@ Invariants, drop connection if violated:
 
 ## Running Bamboo-Point-2-Point Over Bymux
 
-When running the protocol over [bymux](https://github.com/AljoschaMeyer/bymux), the control channel is a channel without backpressure, the data channel has backpressure. Before running bymux over the connection, the connection setup information is negotiated (greedy or safe sending and receiving, compression window sizes). Each endpoint sends a byte whose first six bits are ignored, whose seventh bit indicates whether the endpoints wants to send safely (zero) or greedily (one), and whose eigths bit indicates whether the endpoints wants to receive safely (zero) or greedily (one), followed by the sending compression window size as a [VarU64](https://github.com/AljoschaMeyer/varu64),  followed by the receiving compression window size as a VarU64. After these bytes, the bymux session then begins. It is not necessary to wait for the setup information of the other endpoint before sending point-2-point control data such as granting proposal credit.
+When running the protocol over [bymux](https://github.com/AljoschaMeyer/bymux), the control channel is a channel without backpressure, the data channel has backpressure. Before running bymux over the connection, the connection setup information is negotiated (greedy or safe sending and receiving, compression window sizes). Each endpoint sends a byte whose first six bits are ignored, whose seventh bit indicates whether the endpoints wants to send safely (zero) or greedily (one), and whose eigths bit indicates whether the endpoints wants to receive safely (zero) or greedily (one), followed by the sending compression window size as a VarU64,  followed by the receiving compression window size as a VarU64. After these bytes, the bymux session then begins. It is not necessary to wait for the setup information of the other endpoint before sending point-2-point control data such as granting proposal credit.
