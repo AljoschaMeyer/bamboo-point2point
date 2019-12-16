@@ -2,7 +2,7 @@
 
 A wire format for replicating [bamboo logs](https://github.com/AljoschaMeyer/bamboo) between two nodes that are connected by a reliable, ordered, bidirectional communication link (e.g. a tcp connection).
 
-**Status: Not yet fully stable, but probably already close to the final thing.**
+**Status: Not yet fully stable, but probably already close to the final thing. Will change as bamboo changes as well.**
 
 This protocol deals with the setting in which two nodes store local replicas of bamboo logs, and they want to synchronize and keep each other updated. We don't care *how* that situation arose, the nodes might have met on a local network, on a gossip network over the internet, one node might be running on a usb drive, and so on.
 
