@@ -1,262 +1,324 @@
 # Bamboo Point-2-Point
 
-A wire format for replicating [bamboo logs](https://github.com/AljoschaMeyer/bamboo) between two nodes that are connected by a reliable, ordered, bidirectional communication link (e.g. a tcp connection).
+This document specifies a protocol for exchanging parts of [bamboo logs](https://github.com/AljoschaMeyer/bamboo) between two endpoints. The protocol aims to be efficient, simple, and robust. It allows to make progress even in the face of frequent connection losses, enforces rigorous backpressure, and allows interleaving of data transmissions so that large payloads do not stall out other communication.
 
-**Status: Not yet fully stable, but probably already close to the final thing. Will change as bamboo changes as well.**
+**Status: Not yet stable, some details might still be adjusted. The overall concept feels very solid though, further changes will probably be minor. As such, implementations are very welcome.**
 
-This protocol deals with the setting in which two nodes store local replicas of bamboo logs, and they want to synchronize and keep each other updated. We don't care *how* that situation arose, the nodes might have met on a local network, on a gossip network over the internet, one node might be running on a usb drive, and so on.
+The protocol is first presented as a stateless request-response protocol that is conceptually simple. This description is then extended to a stateful protocol that allows immediat forwarding of newly incoming entries without having to wait for them to be polled for by a new request. This final design is structured such that an endpoint can choose to merely implement the stateless part of the protocol. Any two endpoints can interact meaningfully, regardless of whether they implement the full protocol or the stateless subset.
 
-## Goals
+The protocol is built around a conceptually simple notion, the *interval*. An interval describes a subsequence of the data that makes up a log. A request specifies an interval of interest, and the response transmits the matching data. It starts out at one end of the interval, and progresses through the log entries in ascending or descending order, until either all entries in the interval have been transmitted, or the next piece of data is not available, at which point the response stops. This mechanism of delivering all the data up to the first missing piece and then completely stopping allows to keep the protocol rather simple.
 
-- correctness and progress even over unstable networks
-- simple, but not shying away from optimizations that require only constant space and time
-- efficient usage of bandwidth
-- efficient usage of computational resources in the nodes (cpu time, memory)
-- nodes with vastly different computational resources (think server farm vs microcontroller) can interact meaningfully, no accidental (or deliberate for that matter) DOS attacks
-- complete: no feature creep over time, the protocol is a static, self-contained artifact
+## Notation and Vocabulary
 
-## High-Level Overview
+Throughout this text, we will consider two communicating endpoints. We call the endpoint that sends a request `A` and the endpoint responding to it `B`.
 
-The protocol assumes two reliable, ordered, bidirectional, byte-oriented communication channels between the two endpoints. If only one such channel is available (e.g. a single tcp connection), the two independent channels can be simulated, for example via the [bymux](https://github.com/AljoschaMeyer/bymux) protocol. One of the channels is the *control* channel, the other one is the *data* channel. The control channel is used to negotiate which parts of which logs to exchange, and the data channel is used to transmit these log entries.
+We write `m_i` for the metadata of an entry of sequence number `i`, and `p_i` for the payload of an entry of sequence number `i`. An *item* is either a piece of metadata or a payload. We write `i_i` for an item of sequence number `i`. We define a total order on items: `i_i < i_j` if `i < j`, and `m_i < p_i`. Whenever we speak of "greater" or "lesser" items, we always refer to this order, never to anything else (e.g. never to a size in bytes). To talk about an endpoint which has a specific set of items locally available, we write `B = {i_i, i_j, ...}`.
 
-Replication of logs is fundamentally bidirectional: when both endpoints are interested in entries from a specific log, either of them can relay new data to the other. The replication protocol works by letting any endpoints *propose* to synchronize (parts of) a log. Once the other endpoint has *accepted* such a proposal, the endpoints can then use the data channel to bring each other up to speed with both stored data and as live data becomes available.
+For any natural number `n`, we denote by `v(n)` the highest entry of the certificate pool of `n`, i.e. the smallest natural number greater than or equal to `n` such that there exists a number `k` with `v(n) == ((3^k) - 1) / 2`.
 
-To keep things simple, synchronization proposals are restricted to ranges within a log, rather than allowing random-access to arbitrary subsets. Random access can be emulated by sending multiple proposals for different (small) ranges. Transmission of data follows a strict order: the peers essentially send updates in the order in which they occur in the logs. It is possible to skip over some data, but then the peers cannot go back to transmit it at a later time. Retroactive delivery can however be emulated by sending dedicated synchronization proposals for the data that had been skipped over previously.
+We write `cert_low(n)` for the numbers on the shortest path from `n` to `1` in the graph of backlinks. We write `cert_high(n)` for the numbers on the shortest path from `v(n)` to `n` in the graph of backlinks. When it is clear from context (e.g. we are referring to items), these expressions denote the metadata of the entries of these numbers.
 
-## Session Setup
+## Intervals
 
-Before the regular synchronization phase of the protocol begins, the two endpoits need to agree on a bit of metadata. The protocol requires a way of breaking symmetry between the endpoints. One of the endpoints is called the *proactive* endpoint, the other one is the *reactive* endpoint. How exactly these roles are assigned is irrelevant, as long as both endpoints agree on which role they hold (and they don't both hold the same role). A simple way of assigning these roles is to let the endpoint that initiated the connection be the *proactive* one and the one that accepted the connection attempt be the *reactive* one.
+In this section, we define intervals and how to resolve which data to send in response to the request for an interval. We will define intervals step by step, in our initial definition, an interval consists of two sequence numbers, the `start` and `end`. We write such an interval as `(start, end)`.
 
-Next, each endpoint must convey four pieces of information to the other one (their precise meaning will be explained later):
+Upon receiving a request for an interval, `B` computes the set of items that *satisfy* the interval. For our initial definition, this set contains the payloads `p_start`, `p_end` and all payloads in between, the metadata `m_start`, `m_end` and all metadata in between, `cert_low(min(start, end))`, and `cert_high(max(start, end))`.
 
-- whether it prefers to perform greedy or safe data transmissions
-- whether it is willing to accept greedy data transmissions
-- the maximum size of the compressions window for data it sends
-- the maximum size of the compression window for data it receives
+The *response* consists of `B` sending some of those items to `A`, in a predefined order: if `start < end`, the items are sent sorted from least to greatest (an *ascending* request/response), otherwise from greatest to least (an *descending* request/responds). The response ends if either all the items have been sent, or at the first item that `B` does not have locally available.
 
-The precise way of how this data is exchanged is irrelevant for the further proceeding of the protocol. When this information has been both sent and received, each endpoint derives for pieces of state:
+With this definition, there is no way to request a single-number interval in ascending order. We thus define an *ascending single-number interval* for the sequence number `n`, written as `(n)`, as working just like `(n, n)` except it is ascending.
 
-- the *send mode*: greedy if the endpoint said it wanted to send greedily and the other endpoint indicated it wanted to receive greedily, safe otherwise
-- the *receive mode*: greedy if the endpoint said it wanted to receive greedily and the other endpoint indicated it wanted to send greedily, safe otherwise
-- the *compression window*: the minimum of the maximum compression window size this endpoint wanted to send and the maximum compression window size that the other endpoint wanted to receive
-- the *decompression window*: the minimum of the maximum compression window size this endpoint wanted to receive and the maximum compression window size that the other endpoint wanted to send
+Some examples, assuming `B = {m_1, m_4, p_4, m_5, p_5, m_6, m_7, p_7, m_8}`:
 
-The send mode of one endpoint matches the receive mode of the other endpoint, and vice versa. The same holds for the compression window and the decompression window.
+| Request | Response |
+|---|---|
+| `(4, 4)` | `(m_4, p_4, m_1)` |
+| `(4)` | `(m_1, m_4, p_4)` |
+| `(1, 20)` | `(m_1)` |
+| `(4, 7)` | `(m_1, m_4, p_4, m_5, p_5, m_6)` |
+| `(4, 5)` | `(m_1, m_4, p_4, m_5, p_5, m_6, m_7, m_8)` |
+| `(4, 1)` | `(m_4, p_4)` |
+| `(5, 4)` | `()` |
 
-## The Control Channel
+### Limiting Certificate Pool Metadata
 
-Synchronization proposals are managed via the control channel. Since proposals incur state on the other endpoints (even if they are rejected immediately, that rejected has to be transmitted, which might involve buffering), endpoints are not allowed to send an unbounded number of proposals. Instead, a credit-based system is used. At any point, an endpoint can use the control channel to give the other endpoint *proposal credit* units, up to a maximum of 2^64-1 units. Each unit of credit can be spent to issue one synchronization proposal on the control channel.
+In order to prevent duplicate transmission of metadata across multiple requests, we now extend the definition of an interval with a way of limiting the number of items that are transmitted merely because they are part of some certificate pool. In addition to `start` and `end`, an interval now also contains two more natural numbers, `dist_low` and `dist_high`. Whereas before the response included `cert_low(min(start, end))` in full, it now only includes those items whose distance to `min(start, end)` in the graph of backlinks is at most `dist_low`. `cert_high(max(start, end))` is restricted to the items whose distance to `max(start, end)` in the graph of backlinks is at most `dist_high`.
 
-A synchronization proposal contains the following pieces of information:
+Due to the nature of certificate pools, these numbers need never be larger than 84. By convention, we use 255 to indicate that the full path should be included.
 
-- shared information for both endpoints:
-  - a *synchronization id* (just *id* for short), a number between 0 and 2^64 - 1 to identify the proposal in later messages
-  - which *log* to synchronize: its author's public key, and its log id
-  - the *start* sequence number of the range of entries to synchronize
-  - the *lower certpool info*: a sequence number from the lower certificate pool of the *start* of the range. Synchronization begins by transmitting the metadata of the entries of in the lower certificate pool from this number up to the *start* number. See the explanation of the data channel for a more detailed explanation. This is omitted if a starting *offset* is supplied.
-  - the *expected starting hash* if one exists (see paragraph below for an explanation)
-  - optionally: an *offset* into the payload of the start entry (may be zero). If this is present, then synchronization begins directly at that point in the payload, rather than with the metadata of the start entry.
-  - optionally: an *end* sequence number for the range of entries to synchronize (inclusive), and an *upper certpool info* sequence number that indicates the smallest number in the upper certificate pool up to which to synchronize metadata after the *end* of the range has been reached (see the explanation of the data channel for a more detailed explanation).
-  - a flag to indicate whether to replicate *payload only* or transmit metadata as well
-  - a flag to indicate whether replication of the range should be *sparse*. In sparse replication, rather than transmitting all entries between start and end of the range, only the shortest path from end to start (in the graph of lipmaalinks and backlinks) is transmitted.
-- information particular to the proposing endpoint:
-  - the minimum payload size this endpoint is interested in, payloads below this size will be skipped over rather than transmitted by the other endpoint
-  - the maximum payload size this endpoint is interested in, payloads above this size will skipped over rather than transmitted by the other endpoint
-  - a flag whether *mandatory payload* is activated, or whether it is ok for the other endpoint to skip over payloads even though their size is between the minimum and maximum payload sizes
-  - how *eager* the endpoint is, asking the other endpoint to do one of the following:
-    - send all data regarding this range
-    - only send metadata and payloads up to a certain size, skip over payloads above that size (but notifying that the payload is available)
-    - only notify of metadata and payloads, but don't send it
+We write our new intervals as `(start<dist_low>, end<dist_high>)` for ascending intervals, or `(start<dist_high>, end<dist_low>)` otherwise. If we omit the angle brackets, the corresponding value should be `255`, i.e. the whole certificate pool is being requested. For ascending single-number intervals we write `(<dist_low>n<dist_high>)`.
 
-The *expected starting hash* of a proposal is the target of the lipmaalink of the entry at the lower certpool info of the proposal. If the proposal specifies a starting offset, the expected starting hash is the hash of the starting entry instead. If the lower certpool info is 1, the expected starting hash is omitted (since none existst). The expected starting hash is included with a proposal so that forks can be detected even when neither endpoint has new data for the other.
+Some examples, again assuming `B = {m_1, m_4, p_4, m_5, p_5, m_6, m_7, p_7, m_8}`:
 
-Since both endpoints can issue proposals concurrently, the proactive endpoint uses even ids exclusively, and the reactive endpoint uses odd ids exclusively. The id for a new proposal must be unused. Initially, all ids are considered unused. Sending a proposal marks its id as used, until the id has been fully cancelled - the details of cancellation are explained later.
+| Request | Response |
+|---|---|
+| `(6<2>, 7<0>)` | `(m_4, m_5, m_6, p_6, m_7, p_7)` |
+| `(7<1>, 6<0>)` | `(m_8, m_7, p_7, m_6, p_6)` |
+| `(7<2>, 6<0>)` | `()` |
+| `(5<1>, 5)` | `(m_6, m_5, p_5, m_4, m_1)` |
+| `(5, 5<1>)` | `()` |
 
-After a range has been propopsed for synchronization, both endpoints can *adjust* or *cancel* the proposal. The first adjustment by the non-proposing endpoint serves as a *confirmation* for the proposal, after the confirmation has been sent/received, data can then be transmitted to perform the synchronization.
+### Metadata-Only Intervals
 
-An adjustment allows to do one or more of the following (see the documentation for proposals above for more detailed explanations of the bullt points):
+So far, every interval includes at least one payload, but sometimes it is necessary to fetch merely some part of a certificate pool. An *ascending metadata interval* consists of a `start` sequence number and a `dist_high` number, written as `(m:start<dist_high>)`, and is satisfied by all the items in `cert_high(start)` whose distance to `start` in the graph of backlinks is at most `dist_high`.
 
-- shared information for both endpoints:
-  - decrease the end sequence number of the range
-  - decrease the upper certpool info
-- information particular to the sending endpoint:
-  - set how *eager* the sending endpoint is for this synchronization
-  - make payloads non-mandatory for the other endpoint
-  - increase the minimum payload size the sending endpoint is interested in
-  - decrease the maximum payload size the sending endpoint is interested in
+A *descending metadata interval* consists of a `start` sequence number and a `dist_low` number, written as `(m:<dist_low>start)`, and is satisfied by all the items in `cert_low(start)` whose distance to `start` in the graph of backlinks is at most `dist_low`.
 
-A confirmation must set the eagerness of the confirming endpoint. The endpoint that didn't send the proposal starts out expecting mandatory payloads, having a minimum payload size of zero and a maximum payload size of 2^64 - 1.
+### Relativity
 
-It is possible for both endpoitns to concurrently propose overlapping ranges. Whenever an endpoint receives a proposal whose range overlaps with the range of a not-yet-confirmed proposal it has sent, it acts as if the proposal that begins at a larger sequence number had never been sent. In case of equal starting points, it drops the one sent by the reactive endpoint.
+Sometimes `A` doesn't know the exact sequence numbers of interest, they merely want "some new items" or "some old items". To this end, we allow `start` and `end` to be given as offsets relative to the least or greatest payload that `B` has locally available. `B` resolves these offsets to some absolute numbers, and then proceeds as if those numbers had been supplied for `start` and `end`, with `dist_low` and `dist_high` set to `255`.
 
-In addition to adjusting proposals, it is also possible to cancel them, even before they have been confirmed. When an endpoint cancels a proposal, the other endpoint also cancels it in confirmation. Both endpoints also send a special indicator over the data channel that confirms the cancellation, so there are four messages in total involved in cancellation of a proposal. Once all four of these have been sent/received, all state associated with the proposal can be released and its id can be reused if so desired. The confirmation of cancellation and the messages on the data channel are necessary to ensure correctness in all scenarios, even under concurrent sending by both endpoints over both channels. It doesn't matter whether one endpoint cancelled in confirmation of the other endpoint's confirmation, or whether both endpoints cancel concurrently for their own reasons.
+We write an offset to the least available payload as `...n`, and it is resolved as follows: let `a` be the least sequence number such that `p_a` is locally available to `B`, and let `b` be the least sequence number greater than `a` such that `p_b` is not locally available to `B`. `...n` resolves to `min(a + n, b)`.
 
-Cancellation can happen for multiple reasons, and endpoints might want to react differently to different ones. The following possibilities can be expressed:
+We write an offset to the greatest available payload as `n...`, and it is resolved as follows: let `z` be the greatest sequence number such that `p_z` is locally available to `B`, and let `y` be the greatest sequence number less than `z` such that `y` is not locally available to `B`. `n...` resolves to `max(z - n, y)`.
 
-- cancellation for an unspecified reason, but the receiving endpoint should not propose this synchronization again
-- cancellation due to hitting a resource limit, the other endpoint is encouraged to cancel some other proposal and then try again
-- cancellation because all data in the (finite) range has been synchronized (this is used to "succesfully close" a proposal)
-- cancellation because the other endpoint cancelled
-- cancellation because the other endpoint expects mandatory payloads but this endpoint is unwilling to "block" on missing data
-- cancellation because the expected starting hash didn't match the hash of the corresponding entry at the other endpoint
-  - this cancellation also includes the metadata of the entry that didn't hash to the expected value
-- cancellation because there is an end-of-log entry prior to the lower certpool info (or start of the range in case of a proposal that includes a starting offset)
-  - this cancellation also includes the sequence number of that entry, the other endpoint is then expected to propose synchronizing just that sequence number so that it can learn of (and verify) the end-of-log  
-- cancellation because the feed is forked prior to the lower certpool info (or start of the range in case of a proposal that includes a starting offset)
-  - this cancellation also includes the fork proof: the metadata of the two entries that demonstrate the fork
+Just like there are ascending single-number intervals `(n)`, there are also ascending single-offset intervals `(...n)` and descending single-offset intervals `(n...)`.
 
-This concludes the description of the flow of data on the control channel. Endpoint grant each other proposal credit, send proposals, adjust (and confirm) them and/or cancel them. After a proposal has been confirmed and before it has been fully cancelled, the data channel is used to synchronize the state of the two endpoints regarding that proposal.
+Returning to our running example of `B = {m_1, m_4, p_4, m_5, p_5, m_6, m_7, p_7, m_8}`, `...0` resolves to `4`, `...1` resolves to `5`, `...2` and `...99` both resolve to `6`. `0...` resolves to `7`, `1...` and `99...` both resolve to `6`.
 
-## The Data Channel
+Offsets enable some useful queries such as "as much as possible" (`(...0, 0...)` for ascending order, `(0..., ...0)` for descending order), "the newest hundred entries" (`(100..., 0...)` ascending, `(0..., 100...)` descending) or "everything newer than `n`" (`(n, 0...)`).
 
-The data channel is stateful: for each endpoint, there is a *current proposal* to which all transmitted data pertains. An endpoint can set its current proposal at any point.
+## Further Request Parameters
 
-Each proposal specifies which data needs to be transmitted, beginning with the metadata of entries in the lower certificate pool, then all the data within the range, and then the metadata of the entries in the upper certificate pool. An endpoint maintains a (conceptual) cursor into this sequence of data for each endpoint. When an endpoint sends data, its cursor is moved correspondingly. One piece of data corresponds to either an entry's metadata or its payload. For each piece of payload, the cursor is more fine-grained, it tracks byte-wise progress in the transmission of the payload.
+We now have fully defined intervals, but requests also take some further parameters.
 
-Synchronization works by having the endpoints advance their cursor by sending data, until the end of the range is reached (if an end exists). Moving the cursor can be done in different ways:
+By default, `A` expects `B` to only send pieces of metadata whose signature is correct and only payloads of the correct hash and size as specified in the corresponding metadata. A response containing items that don't fulfill these criteria is considered malicious, usually leading to the connection being terminated. `A` can however specify the request to be *unverified*, in which case `B` is allowed to respond with unverified items. This can speed up the transmission of data, at the risk of wasting bandwidth on invalid data.
 
-- notifying of some number of pieces of data: advances the cursor without actually transmitting the data. This is used when the other endpoints requested notifications rather than actual data transfer in its eagerness. It is also used to move the cursor of one enndpoint past data that has already been transmitted by the other endpoint (this must be done explicitly to ensure correctness in case of concurrent transmissions by both endpoints).
-- advance the cursor past one payload because it is smaller than the minimum size to be transmitted
-- advance the cursor past one payload because it is larger than the maximum size to be transmitted
-- advance the cursor past one payload because it is unavailable (only allowed if transmission of payloads is not mandatory)
-- advance within a payload by some number of bytes, without actually sending them (this is only allowed to let the cursor of one endpoint to catch up with the cursor of the other endpoint - in such a situation the peers would switch the role of which one is "ahead" within a single payload... such situations seem rather contrived, but the protocol supports them)
-- sending the metadata of an entry (the actual encoding omits some of it that can be reconstructed from context)
-- sending some number of bytes of a payload
+A request can specify a *minimum payload size* and a *maximum payload size*. When checking which items are part of the response, entries whose payload is too large or too small are treated as though they were not locally available. In particular, this means that responses end just before the first mismatching payload. These filters do not apply to the resolution of relative offsets.
 
-Payloads can be sent in raw form or in compressed form. The compression format is [LZFoo](https://github.com/AljoschaMeyer/lzfoo). When sending data, the maximum size of the compression window that has been negotiated at the beginning of the connection must be respected. Copy instructions may not point further into the path than the window size. The same backlog of decompressed data is shared across all different synchronization proposals, and the window is never reset. This allows to achieve good compression even for short payloads and when payloads from multiple proposals are interleaved. When raw data is transferred, it does *not* contribute to the decompression buffer.
+A request with an absolute `start` value can specify to be an *immediate payload* request. No items from the part of the certificate pool corresponding to the `start` value are transmitted, and neither is `m_start`. Instead, `p_start` is sent immediately. An immediate payload request also specifies an offset into the payload at which to start transmitting. This feature is used to make progress even in the face of connection failures while a large payload is being transmitted.
 
-The other options negated during connection setup are whether sending of data is greedy or safe. In safe send mode, an endpoint is only allowd to transmit metadata and payloads that passed verification - invalid data leads to the whole connection being terminated immediately. In greedy mode, data can be forwared immediately, before being verified. This is most beneficial in case of large payloads, where blocking for the full payload to arrive (to be able to verify it) would lead to long idle periods. Even in greedy mode, data must be verified once it has been fully transmitted. If an endpoint detects that it sent invalid data, it must immediately send an *apology*, both endpoints then move the cursor back by one and pretend the invalid data (either metadata or a payload) had never been transmitted. An apology can be sent in the middle of transferring a payload. An apology can not apply retroactively: if an endpoint sends invalid data and then begins sending the next piece of data for the same proposal, then the connection is terminated.
+A request can be *lazy*, in which case the response merely conveys how much data would have been sent rather than sending the data itself. The response consists of the number of complete items that would've been sent, and, if the next item would be a payload of which `B` does not have all bytes available locally, the number of consecutive bytes starting from the beginning of the payload which `B` *does* have available.
 
-## Encodings
+The response to a lazy immediate payload request works slightly differently. If the response includes all of the initial payload, it is simply counted as one item. Otherwise, the number of items is set to zero, and the number of bytes is the longest consecutive sequence available to `B` starting at the specified offset.
 
-TODO streamline terminology, this uses "request" instead of "proposal" etc.
+The response to a lazy request also contains the hash of the last piece of metadata that would have been sent if the response had not been lazy, if there is one.
 
-Encoding on the control channel:
+A request that is not lazy is also called *eager*.
 
-- the byte 0 indicates granting proposal credit, followed by the amount of credit units as a [VarU64](https://github.com/AljoschaMeyer/varu64)
-- a byte >= 1 and <= 127 (first bit is zero but at least one other bit is one): adjust
-  - initial byte is followed by the request number as a VarU64
-  - remaining seven bits of the first byte are flags, indicating which things to adjust. Some of them add more information by appending some additional bytes, in the order of the flags:
-    - 2nd and 3rd bit: set the eagerness the sending endpoint requests:
-      - `01`: only notify
-      - `10`: send all metadata, and send payload up to the size that is appended as a VarU64
-      - `11`: send everything
-    - 4th bit: allow the other endpoint to skip payloads for this request (cannot be undone)
-    - 5th bit: append the new ending seqnum as a VarU64. It gets ignored if it isn't less than the old one.
-    - 6th bit: append the new upper certpool info as a VarU64. It gets ignored if it isn't less than the old one.
-    - 7th bit: append the new minimum payload size of interest to the sending endpoint as a VarU64
-    - 8th bit: append the new maximum payload size of interest to the sending endpoint as a VarU64
-- the byte 128: cancel: don't try this request again
-- the byte 129: cancel: cancelled due to resource limit, maybe cancel another request and try again
-- the byte 130: cancel: reached end of the range
-- the byte 131: cancel: confirming a cancel from the other endpoint
-- the byte 132: cancel: cancelling because you set the mandatory payload flag but I want to advance without that payload
-- the byte 133: cancel: the expected starting hash didn't match
-  - followed by the metadata of the entry that didn't hash to the expected value
-- the byte 134: cancel: there's an end-of-log entry prior to the lower certpool info/start of the range
-  - followed by the sequence number of that entry as a VarU64
-- the byte 135: cancel: feed is forked
-  - followed by the metadata of the two entries that demonstrate the fork
-- a byte >= 136 and <= 160: unused
-- a byte >= 160 (first bit is one, 2nd and 3rd bit are not both zero): request
-  - initial byte is followed by:
-    - the request number as a VarU64
-    - the 32 bytes of the public key of the log that this request is about
-    - the log id of the log that this request is about as a VarU64
-    - the sequence number at which the request starts as a VarU64
-    - if the fifth bit of the initial byte is not set: the lower certpool info as a VarU64
-    - the minimum payload size of interest to the sending endpoint as a VarU64
-    - the maximum payload size of interest to the sending endpoint as a VarU64
-    - the *expected starting hash*:
-      - if the range starts with a payload (5th bit flag is set):
-        - the hash of the metadata of the starting entry
-      - else if the lower certpool info is not sequence number one:
-        - the canonic hash of the lipmaalink target of the lower certpool info hash
-      - else:
-        - nothing
-  - remaining seven bits of the first byte are flags. Some of them add more information by appending some additional bytes, in the order of the flags:
-    - 2nd and 3rd bit: set the eagerness the sending endpoint requests:
-      - `01`: only notify
-      - `10`: send all metadata, and send payload up to the size that is appended as a VarU64
-      - `11`: send everything
-    - 4th bit: the range is finite, append the ending sequence number and the upper certpool info as VarU64s
-    - 5th bit: range begins with the payload, at the offset appended as a VarU64
-    - 6th bit: the request is for payloads only, no metadata
-    - 7th bit: the request is sparse
-    - 8th bit: payloads cannot be skipped
+### Stored Fork Proofs
 
-Invariants, drop connection if violated:
+We call two entries from the same log a *fork* if they have identical metadata except for the payload hash or the payload size (and the signature). We call two entries `x` and `y` from the same log a *fork proof* in one of the following cases:
 
-- outstanding request credit is at most 2^64 - 1
-- no requests are sent if there had been no credit for them
-- the proactive endpoint only creates even request numbers, the reactive endpoint only odd ones
-- only create request with an unused request number
-- only cancel and adjust requests that are currently active
-- don't adjust or cancel a request after having already cancelled it
-- the confirmation adjustment for a proposal must set an eagerness
-- a range end (proposed or adjusted) is never strictly less than the start of the range
-- an upper certpool info (proposed or adjusted) is never strictly less than the end of the range
-- a lower certpool info (proposed or adjusted) is never strictly greater than the start of the range
-- lower and upper certpool infos are taken from the certificate pools of the start/end of the range respectively, this invariant must be preserved even as the end of a range is adjusted
-- a new minimum payload size is never strictly less than the old one
-- a new maximum payload size is never strictly legreater than the old one
-- sequence numbers are nonzero
-- may not send an unused first byte
+- `x` and `y` are a fork. The *position* of the fork is their sequence number. The *cause* of the fork is `{x, y}`.
+- Two of their backlinks point to the same sequence number `n` but have different values. The *position* is `n`. The targets of those links form another fork proof. The *cause* of `x` and `y` is the cause of that fork proof.
+- `x` has a backlink pointing at the sequence number of `y` but with the value unequal to the hash of `y`. The *position* is the sequence number of `y`. The targets of the backlink and `y`  form another fork proof. The *cause* of `x` and `y` is the cause of that fork proof.
+- `x` is an end-of-log entry and `y` has a greater sequence number than `x`. The *position* is the sequence number of `x`. The *cause* consists of `x` and its successor on the path to `y`.
 
-Encoding on the data channel:
+A regular response may never contain two items that together form a fork proof.
 
-- the byte 0: switch current request number
-  - followed by the request number to which to switch as a VarU64
-- the byte 1: unused
-- the byte 2: notify of one piece of data
-- the byte 3: notify of n pieces of data
-  - followed by n as a VarU64
-- the byte 4: skipping payload because it is too small
-- the byte 5: skipping payload because it is too large
-- the byte 6: skipping payload because I don't have it
-- the byte 7: skipping over n bytes of payload
-  - followed by n as a VarU64
-- the byte 8: uncompressed payload
-  - followed by the number of bytes as a VarU64
-  - followed by that many bytes of payload
-- the byte 9: compressed payload
-  - followed by the length of the uncompressed data as a VarU64
-  - followed by the length of the compressed data as a VarU64
-  - followed by that many bytes of LZFoo-compressed data
-- a byte >= 10 and <= 15: unused
-- the byte 16: apology
-- a byte >= 17 and <= 31: unused
-- the byte 32: a request has been cancelled
-  - followed by the request number that has been cancelled as a VarU64
-- a byte >= 33 and <= 127: unused
-- the byte 128: metadata for a log entry with tag byte 0
-  - if the entry has distinct lipmaalink and backlink:
-    - the backlink, unless the metadata of its target has already been transmitted as part of this request
-  - followed by the size of the payload as a canonical VarU64
-  - followed by the hash of the payload
-  - followed by the signature of the entry (64 bytes)
-- the byte 129: send metadata for a log entry with tag byte 1
-  - followed by the same data as the byte 128
-- a byte >= 130: unused
+There are two different ways of handling requests for a forked log. By default, `B` may send a fork proof of the log in question at any point of the response, immediately terminating the response. `B` should (but is not obligated to) deliver the fork proof as early as possible. If `B` has multiple fork proofs to choose from, they should send one of minimal position in case of an ascending request, or one of maximal position in case of a descending request.
 
-Invariants, drop connection if violated:
+Alternatively, a request can specify *local* fork handling. With this parameter set, `B` is only allowed to send a fork proof of position `p` if the next item to send has sequence number greater than or equal to `p` in case of an ascending request, or less than or equal to `p` in case of the descending request. A request with local fork handling may also includes a *trust anchor* consisting of a pair of a sequence number `n` and a hash `h`.
 
-- only switch to a request number for which there is an active request
-- only cancel a request number for which there is an active request
-- after cancelling the current request number, only switching the request number is allowed
-- only send payload-related and metadata-related packets at the appropriate time (alternating)
-- compression must respect the negotiated window size (and cannot be used if the window size is zero)
-- all packets that advance in the log (including `notify n`) may not move past the end of the request
-- transmission and skipping of payload data may not exceed the payload size specified by the corresponding metadata
-- must respect the eagerness setting of the other endpoint (don't end data when only notifications are expected, don't notify when data is expected)
-- may not use bytes 4 or 5 (skipping payload because it is too small or large respectively) if the corresponding metadata proves otherwise
-- may not use byte 6 (skip payload because it is unavailable) if the request doesn't allow skipping payloads
-- may not send an apology for valid data (although it *is* allowed to send an apology after transmitting a proper prefix of a payload, even though that prefix might have been correct)
-- may not send more than one apology for the same piece of data
-- in safe sending mode, may not transmit invalid (i.e. non-verifying) data
-- may not send an unused first byte
-- not an invariant, just a friendly reminder: don't blindly allocate memory based on payload sizes claimed by the peer, enforce a maximum allocation amount and split up the processing over time as necessary
+A trust anchor limits which forks proofs `B` is allowed to send. If the request is ascending, `B` may only send fork proofs whose cause has a position strictly greater than `n` and whose cause contains an entry from which there is a path of entries to an entry of hash `h` and sequence number `n`. If the request is descending, `B` may only send fork proofs whose cause has a position strictly less than `n` and whose cause contains an entry to which there is a path of entries from an entry of hash `h` and sequence number `n`.
 
-## Running Bamboo-Point-2-Point Over Bymux
+All these restrictions also apply to lazy requests. For a lazy request, the position against which to check whether a fork proof may be sent in local mode is the start of the interval. If there is a fork proof beyond the start of the interval, the lazy response first reports the number of items until that position, the hash of the newest items if required, and then the fork proof.
 
-When running the protocol over [bymux](https://github.com/AljoschaMeyer/bymux), the control channel is a channel without backpressure, the data channel has backpressure. Before running bymux over the connection, the connection setup information is negotiated (greedy or safe sending and receiving, compression window sizes). Each endpoint sends a byte whose first six bits are ignored, whose seventh bit indicates whether the endpoints wants to send safely (zero) or greedily (one), and whose eigths bit indicates whether the endpoints wants to receive safely (zero) or greedily (one), followed by the sending compression window size as a VarU64,  followed by the receiving compression window size as a VarU64. After these bytes, the bymux session then begins. It is not necessary to wait for the setup information of the other endpoint before sending point-2-point control data such as granting proposal credit.
+### Partial Fork Proofs
+
+A request can include up to four *expected hashes* of certain pieces of metadata: the skiplink target of the least piece of metadata that would be part of a full response, the metadata corresponding to the least payload that would be part of a full response, the metadata corresponding to the greatest payload that would be part of a full response, and the greatest piece of metadata that would be part of a full response. These can only be specified in cases where their sequence number is uniquely determined, i.e. if their position does not depend on resolving an offset.
+
+`B` might have an item that would form a fork proof together with an entry of the expected hash at that sequence number. This item is called a *partial fork proof*. Unless a trust anchor specifies to ignore forks at this position, `B` can terminate the response by sending the partial fork proof - immediately in default fork handling, or at the appropriate point in local fork handling. Note how `A` thus ultimately obtains a full fork proof, but `B` doesn't. In fact, `A` might have lied about an expected hash. If `B` wants to know for sure, they can make a request for the item in question.
+
+## Canceling Requests
+
+`A` might lose interest in the response to a request before that response has arrived. To this end, `A` can *cancel* any previously issued request. `A` cannot consider that request to be canceled immediately though, since `B` might have sent the response concurrently. Thus, upon receiving a cancellation, `B` sends the empty response as confirmation. In some sense, `A` issuing a cancellation doesn't really cancel anything, it merely prompts `B` to respond immediately.
+
+## Stateful Synchronization
+
+A request/response protocol as described above is stateless in the sense that a request can be processed and then be forgotten about. Statelessness leads to a problem though: data can only be sent if it has been requested. If an endpoint wants to always keep up to date with a log, it needs to constantly send new requests, a technique called *polling*. It would be nice if an endpoint could ask in advance to receive new items as they become available. This requires to manage state across requests, endpoints need to remember which new items to forward.
+
+Interestingly enough, our protocol can easily be extended to become stateful: whenever `B` would terminate a response because they lack an item, they instead pause the response, resuming it once that item becomes available - possibly to immediately be paused again afterwards. The only other change is to merely pause responses for intervals whose `end` is specified as an offset after the end has been reached, and to reevaluate the offset as new items become available. For example an ascending interval ending at `0...` would pause once the newest item has been sent, and if an even newer item became available, the response would be resumed.
+
+In the stateful case, it can happen that both endpoints have a paused request that would resume with the same item(s). Suppose `A` then obtains the item(s) and sends them to `B`. It would not make sense for `B` to then send them back to `A` again. Instead, `B` has to send a confirmation in place of the item(s) and then advances which item should be sent next. This confirmation works similarly to a lazy response: it contains the number of fully received items (with the first item of an immediate payload request counting as fully received if its last byte has been transmitted), and how many bytes of a partially transmitted last item have been received. The confirmation mechanism is necessary to correctly handle cases where both endpoints send the same item(s) concurrently. In the same setting, if `B`'s request was lazy, `B` would still send a confirmation to `A` and advance which item to send next upon receiving a notification that `A` had new items available. The confirmation would mirror `A`'s notification.
+
+## The Actual Protocol
+
+The protocol assumes a reliable, ordered, byte-oriented channel between the two endpoints. Endpoints send each other messages. An endpoint reads bytes until a full message has been received, checks that it is valid, acts on it, and then waits for the next message. An invalid message is always handled by terminating the connection. We now describe the precise protocol by listing the state maintained by the endpoints, the different kinds of messages, how they are encoded, their validity criteria, and how to react to them.
+
+### Global Connection State
+
+To avoid overloading endpoints, there is a backpressure mechanism in place: some types of messages - requests, adjustments and responses - may only be sent after permission has been granted. This is implemented as a credit system. Sending a request consumes one *request credit*, and may only be done if at least one credit is available. Endpoints start out with zero request credit available, but can grant each other request credit via messages, up to a maximum of `2^64 - 1`.
+
+There is a similar mechanism for responses, but instead of limiting the number of response messages, *response credit* limits the number of metadata and payload bytes that may be sent. Details on credit handling are given in the sections on the messages impacted by it. For now, it suffices to state that each endpoint maintains four 64-bit counters for credit: `credit_request_mine`, `credit_request_yours`, `credit_response_mine` and `credit_response_yours`. All of these are initially set to zero.
+
+Response data is sent in a stateful way. Rather than tagging every item with information on which request it pertains to, there is a *active request* and all incoming response data pertains to that request. An *active request message* changes the currently active request. An endpoint keeps track of `active_request_mine` and `active_ request_yours`. Both are *request ids*, which are simply 64-bit integers, and are initially set to zero. A request id can either be *fresh* or *used* for an endpoint. Initially, all request ids are fresh for both endpoints. The descriptions of the message types below indicate how certain ids change from fresh to used and back again. Certain messages are invalid if an id of the wrong state is supplied.
+
+The remainder of the state of the connection consists of the various requests opened by either endpoint.
+
+### Messages
+
+There are seven different kinds of messages:
+
+- Request messages indicate new interest in a part of a log.
+- Response messages transmit items, item sizes, and indicate the end of a response.
+- Active request messages change to which request the following response messages pertain.
+- Cancellation messages ask the other endpoint to immediately end a particular response.
+- Adjustment messages can efficiently update whether a request is lazy or eager.
+- Request credit messages allow the other endpoint to send more request messages.
+- Response credit messages allow the other endpoint to send more response messages.
+
+In the following definition of the encoding for the various message types, 64-bit integers are always encoded as [VarU64s](https://github.com/AljoschaMeyer/varu64), and hashes are always encoded as [YAMF-Hashes](https://github.com/AljoschaMeyer/yamf-hash). `dist_low` and `dist_high` are always encoded as a single byte.
+
+#### Request Messages
+
+A request message consists of the log id to be requested, the request id, the interval of interest, the fork handling mode (default, local, or local with a trust anchor), an optional minimum payload size, an optional maximum payload size, an optional immediate payload offset, whether responses should be verified, and whether responses should be lazy.
+
+The request id does not necessarily have to be fresh for the sending endpoint (i.e. this is not a validity criterium that must be checked), but sending a used one might lead to receiving garbage responses. If the request id was fresh, it then becomes used.
+
+When sending a request message, an endpoint decrements `credit_request_mine`. If it would fall below zero, the message may not be sent. When receiving a request message, an endpoint decrements `credit_request_yours`. If it would fall below zero, the message is invalid.
+
+The encoding of a request message consists of two bytes of metadata, followed by some *base data*: the request id, followed by the log id, encoded as the raw public key (32 bytes) followed by the log number. Depending on the two metadata bytes, different pieces of data follow the base data. If multiple pieces of data follow, their order is the order in which they are presented in the following list:
+
+- The first bit of the two metadata bytes is always 0, to indicate that the message is a request message.
+- The second and third bit indicate the fork handling mode:
+  - `00` indicates default fork handling
+  - `01` indicates local fork handling without a trust anchor
+  - `10` indicates local fork handling with a trust anchor (sequence number and hash), the base data is followed by the sequence number, followed by the hash
+  - `11` makes an invalid message
+- The fourth bit is set to `1` if there is a minimum payload size for this request, `0` if there isn't. If it is set to `1`, the base data is followed by the minimum payload size.
+- The fifth bit is set to `1` if there is a maximum payload size for this request, `0` if there isn't. If it is set to `1`, the base data is followed by the maximum payload size.
+- The sixth bit is set to `1` if the request is an immediate payload request, `0` if it isn't. If it is, the base data is followed by the offset at which the transmission of the payload bytes should begin.
+- The seventh bit is set to `1` if responses must be verified, `0` if they may be unverified.
+- The eighth bit is set to `1` if the request is lazy, `0` if it isn't.
+- The second byte of metadata concerns the interval of the request.
+  - If the interval is a regular interval (consisting of a start and an end), the ninth and tenth bit are set to `0`.
+    - If the start of the interval is an absolute value:
+      - The 11th bit is set to `0`, and the base data is followed by the absolute `start` sequence number and either `dist_low` if the interval is ascending or `dist_high` if the interval is descending.
+      - If the 12th bit is set to `1`, the base data is followed by a hash. If the interval is ascending, this hash is the expected hash for the skiplink target of the least piece of metadata that would be part of a full response. If the interval is descending, this hash is the expected hash for the greatest piece of metadata that would be part of a full response.
+      - If the 13th bit is set to `1`, the base data is followed by a hash. If the interval is ascending, this hash is the expected hash for the metadata corresponding to the least payload that would be part of a full response. If the interval is descending, this hash is the expected hash for the metadata corresponding to the greatest payload that would be part of a full response.
+    - If the start of the interval is an offset relative to the least available payload, the 11th bit is set to `1` and the 12th and 13th bit are set to `0`, and the base data is followed by the offset.
+    - If the start of the interval is an offset relative to the greatest available payload, the 11th bit is set to `1`, the 12th bit is set to `0`, and the 13th bit is set to `1`, and the base data is followed by the offset.
+    - If the end of the interval is an absolute value:
+      - The 14th bit is set to `0`, and the base data is followed by the absolute `end` sequence number and either `dist_high` if the interval is ascending or `dist_low` if the interval is descending.
+      - If the 15th bit is set to `1`, the base data is followed by a hash. If the interval is descending, this hash is the expected hash for the metadata corresponding to the least payload that would be part of a full response. If the interval is descending, this hash is the expected hash for the metadata corresponding to the greatest payload that would be part of a full response.
+      - If the 16th bit is set to `1`, the base data is followed by a hash. If the interval is ascending, this hash is the expected hash for the skiplink target of the least piece of metadata that would be part of a full response. If the interval is ascending, this hash is the expected hash for the greatest piece of metadata that would be part of a full response.
+    - If the end of the interval is an offset relative to the least available payload, the 14th bit is set to `1` and the 15th and 16th bit are set to `0`, and the base data is followed by the offset.
+    - If the end of the interval is an offset relative to the greatest available payload, the 14th bit is set to `1`, the 15th bit is set to `0`, and the 16th bit is set to `1`, and the base data is followed by the offset.
+  - If the interval is an ascending single-number interval:
+    - The ninth bit is set to `1` and the 10th bit is set to `0`, and the base data is followed by the sequence number.
+    - If the ascending single-number interval is given by an absolute number:
+      - The 11th and 12th bit are set to `0`, and the base data is followed by `dist_low` and `dist_high`.
+      - The 13th bit is set to `1` if an expected hash for the skiplink target of the least piece of metadata that would be part of a full response is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+      - The 14th bit is set to `1` if an expected hash for the metadata corresponding to the sequence number is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+      - The 15th bit is set to `1` if an expected hash for the greatest piece of metadata that would be part of a full response is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+      - The 16th bit may be set arbitrarily and must be ignored.
+    - If the ascending single-number interval is given by an offset relative to the least available payload, the 11th bit is set to `1` and the 12th bit is set to `0`. Bits 13 to 16 may be set arbitrarily and must be ignored.
+    - If the ascending single-number interval is given by an offset relative to the greatest available payload, the 11th bit is set to `1` and the 12th bit is set to `1`. Bits 13 to 16 may be set arbitrarily and must be ignored.
+    - If the 11th bit is set to `0` and the 12th bit set to `1`, the message is invalid. Bits 13 to 16 may be set arbitrarily and must be ignored.
+  - If the interval is a metadata interval:
+    - The ninth bit is set to `1` and the 10th bit is set to `1`, and the base data is followed by the sequence number.
+    - If it is a descending interval:
+      - The 11th bit is set to `0`, and the base data is followed by `dist_low`.
+      - The 12th bit is set to `1` if an expected hash for the skiplink target of the least piece of metadata that would be part of a full response is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+      - The 13th bit is set to `1` if an expected hash for the metadata corresponding to the sequence number is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+    - If it is an ascending interval:
+      - The 11th bit is set to `1`, and the base data is followed by `dist_high`.
+      - The 12th bit is set to `1` if an expected hash for the greatest piece of metadata that would be part of a full response is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+      - The 13th bit is set to `1` if an expected hash for the metadata corresponding to the sequence number is supplied, in which case the base data is followed by that hash. Otherwise, it is set to `0`.
+    - Bits 14 to 16 may be set arbitrarily and must be ignored.
+
+#### Response Messages
+
+Response messages are sent to satisfy requests. They come in three variants: *eager response messages* transmit some number of bytes which encode requested items, *lazy response messages* notify of the availability of some items, and *end response messages* signal the end of a response even though more items could have followed.
+
+##### Eager Response Messages
+
+An eager response message is encoded as the byte `0x80`, sometimes followed by a sequence number (see the next paragraph), followed by the number of bytes it contains, and then that many bytes. When sending such a message, an endpoint decreases `credit_response_mine` by that much, and if it would fall below zero, the message may not be sent. When receiving such a message, an endpoint decreases `credit_response_yours` by that much, and if it would fall below zero, the message is invalid. An eager response message is also invalid if it pertains to a lazy request.
+
+If no prior eager or lazy response messages have been sent for the currently active request and the start of the request has been given as a relative offset, then the initial `0x80` byte is followed by the sequence number of the payload to which the start offset has been resolved.
+
+The actual bytes that are being sent depends on the request. The order in which the satisfying items are being sent is predetermined, so there is no need for any more transmission metadata. Endpoints merely need to keep track of the current state of the item transmission for each of their requests. An endpoint is allowed to chop up responses in any way it sees fit, for example it might send the first three bytes of metadata, but then start sending completely unrelated messages, even responding to other requests, before continuing transmission where it left of.
+
+Payloads are transmitted verbatim, but metadata items omit some information which can be reconstructed from context, e.g. the log id. The bytes to transmit for a piece of metadata are defined as follows:
+
+- The tag byte of the entry.
+- The value of the skiplink, unless it is equal to the predecessor link or the metadata of its target has already been transmitted as part of this response or its value has been given as an expected hash.
+- The value of the predecessor link, unless the metadata of its target has already been transmitted as part of this response or its value has been given as an expected hash.
+- The size of the payload.
+- The hash of the payload.
+- The signature of the entry.
+
+##### Lazy Response Messages
+
+A lazy response message notifies the other endpoint of some number of items. It consists of the number of full items, and the size of the partially available trailing payload (which may frequently be zero). A lazy response message is invalid if it pertains to an eager request, unless the responding endpoint has received the data which the lazy response message indicates from the requesting endpoint itself via another request.
+
+A lazy response message furthermore carries the hash of the last piece of metadata that would have fully been part of the response if it was eager, if there is one.
+
+A lazy response message is encoded as the byte `0x90`, sometimes followed by a sequence number (see the next paragraph), followed by the number of full items and the number of trailing payload bytes, followed by the hash if there is one.
+
+If no prior eager or lazy response messages have been sent for the currently active request and the start of the request has been given as a relative offset, then the initial `0x90` byte is followed by the sequence number of the payload to which the start offset has been resolved.
+
+##### End Response Messages
+
+An end response message terminates a response. When sending such a message, the request id `active_request_mine` becomes fresh for the sending endpoint. When receiving such a message, the request id `active_request_yours` becomes fresh for the sending endpoint.
+
+An end response message contains some information on why the response has been ended. All end response messages begin with a byte whose first four bits are set to `0xa`.
+
+The 5th and 6th bit indicates different reasons for the end response message:
+
+- `00` indicates that the response has been ended because a full fork proof is available. If the fork handling mode of the request does not allow transmitting a fork proof at this position, the message is invalid. The byte is followed by the two pieces of metadata (omitting the log id) that constitute the fork proof, each encoded as follows:
+  - The tag byte of the entry.
+  - The sequence number of the entry.
+  - The value of the skiplink.
+  - The value of the predecessor link.
+  - The size of the payload.
+  - The hash of the payload.
+  - The signature of the entry.
+- `01` indicates that the response has been ended because a partial fork proof is available. If the fork handling mode of the request does not allow a fork proof at this position, the message is invalid. The byte is followed by the piece of metadata that constitutes the partial fork proof, encoded as above.
+- `10` indicates that the response has been ended because of a cancellation or adjustment message.
+- `11` indicates that the response has been ended for some other reason.
+
+The 7th bit can modify request credit: If it is set to `1`, the receiving endpoint is being granted one request credit.
+
+If the 8th bit is set to `1`, the message is immediately followed by a request id, which becomes the new active request id. The message is invalid, if the id is fresh.
+
+A request for an interval with an absolute end value is automatically ended by an eager or lazy response message that reaches the end of the interval. The request id becomes fresh automatically, so sending an explicit end message would actually be invalid. An eager or lazy response message which overshoot the end of the interval is also invalid.
+
+#### Request Credit Messages
+
+A request credit message consists of a single 64-bit integer. When sending such a message, the endpoint increases `credit_request_ yours` by the sent amount. When receiving such a message, the endpoint increases `credit_request_mine` by the received amount. If it would overflow (become greater than `2^64 - 1`), the message is invalid.
+
+A request credit message is encoded as the byte `0xb0` followed by the amount of granted credit.
+
+#### Response Credit Messages
+
+A response credit message consists of a single 64-bit integer. When sending such a message, the endpoint increases `credit_response_ yours` by the sent amount. When receiving such a message, the endpoint increases `credit_response_mine` by the received amount. If it would overflow (become greater than `2^64 - 1`), the message is invalid.
+
+A response credit message is encoded as the byte `0xc0` followed by the amount of granted credit.
+
+#### Cancellation Messages
+
+A cancellation message consists of a single 64-bit integer, the request id to be canceled. When receiving such a message, the endpoint should close the corresponding request (details are given in the description of response messages). If the id is currently fresh for the other endpoint, the message is invalid.
+
+A cancellation message is encoded as the byte `0xd0` followed by the request id.
+
+#### Active Request Messages
+
+An active request message consists of a  64-bit integer, the *offset*, and a mode, either addition or subtraction. When sending such a message in addition mode, the endpoint adds the offset to `active_request_mine`, in subtraction mode it is subtracted instead. When receiving such a message in addition mode, the endpoint adds the offset to `active_request_yours`, in subtraction mode it is subtracted instead. If the computation overflows or underflows, the message is invalid. If the id is currently fresh for the other endpoint, the message is invalid.
+
+An active request message in addition mode is encoded as the byte `0xe0` followed by the request id offset. An active request message in subtraction mode is encoded as the byte `0xe8` followed by the request id offset.
+
+#### Adjustment Messages
+
+*Adjustment messages* have not been mentioned in the description of the protocol, this is because they are merely an efficient shortcut for canceling a request and creating a new one that differs only in its laziness.
+
+Each adjustment message specifies two request ids: The *old* one (must be used or the message is invalid), and the *new* (should be fresh, otherwise leads to garbage data). Upon receiving an adjustment message, an endpoint should immediately end the old request, as if it had been canceled. It also acts as if it had just received a request message that would lead to a request identical to the old one, except for the id and the adjustment, as described in the following paragraphs. It may however only set the current request to the new one after it has sent the cancellation for the old one - any message setting the current request to the new id too early is invalid.
+
+If the old request was lazy, the new request is eager and vice versa. The new request begins at exactly the position in the stream of items where the old message was canceled, unless a different position has been specified:
+
+A toggle adjustment message can optionally specify a sequence number `n` and an optional offset `i` into a payload. `n` and `i` specify a position in the stream of item data: If no `i` is supplied, it is the position of the metadata corresponding to the entry of sequence number `n`. If `i` is supplied, it gives an offset into the payload for the entry of sequence number `n`.
+
+In the following description, we compare the supplied position with the current position in the stream of items of the old request. If no such position is known (the request has a relative start offset and no eager or lazy response message has been sent yet), the supplied position counts as greater in case of an ascending request, and as lesser in case of a descending request. Otherwise, the two positions are compared by which item would have come first in an ascending/descending request.
+
+The state for the new request depends on the old one at the time of sending its cancellation:
+
+- If the old request was lazy and the position in the stream of items is less than or equal to the supplied position, the new request starts at the supplied position.
+- If the old request was lazy and the position of the stream of items is greater than the supplied position, the new request starts at the same position where the old message left off, but automatically switches to eager at the supplied position.
+- If the old request was eager and the position of the stream of items is less than or equal to the supplied position, the new request starts at the the same position where the old message left off.
+- If the old request was eager and the position of the stream of items is greater than the supplied position, the new request starts at the same position where the old message left off, but automatically switches to lazy at the supplied position.
+
+If the old request had no known current position, the supplied position also acts as the start position of the new request, with a `dist_low` of zero if it is ascending, or a `dist_high` of zero if it is descending. If the old request had a known position, and the supplied position was not the position of an item in the response item stream, the message is invalid.
+
+An adjustment message is encoded as the byte `0xf0` if it does not specify a position, as `0xf8` if it does but the position does not contain a payload offset, or as `0xfc` if it does. Both are followed by the old request id and the new request id. If the first byte is `0xf8` or `0xfc`, it is then followed by the sequence number. if the first byte is `0xfc`, it is then followed by the offset.
